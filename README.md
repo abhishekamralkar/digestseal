@@ -1,6 +1,12 @@
 # DigestSeal
 
+<img src="logo.png" alt="DigestSeal logo" width="540">
+
 DigestSeal is a Rust CLI for signing OCI images. It defaults to NIST ML-DSA-65 and supports opt-in Ed25519 and ECDSA P-256. It saves a detached signature bundle and attaches it to the image as an OCI referrer. Tags, repositories, and registries can change while the same bundle stays valid for the exact image digest.
+
+## Install
+
+Download the archive for your platform and verify it against the release's `SHA256SUMS` file. Extract `digestseal` (or `digestseal.exe` on Windows) and put it on your `PATH`. Releases include Linux and macOS binaries for x86-64 and ARM64, plus a Windows x86-64 binary. The Linux binaries are built against glibc on Ubuntu 24.04. [GitHub Releases](https://github.com/abhishekamralkar/digestseal/releases)
 
 ## Build
 
