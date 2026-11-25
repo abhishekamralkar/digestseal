@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -14,6 +15,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
 const SIGNATURE: &str = "application/vnd.microsign.signature.v1+json";
 const PAYLOAD_TYPE: &str = "application/vnd.microsign.image-signature.payload.v1+json";
 const SOURCE: &str = "build/image";
@@ -39,25 +41,16 @@ fn exercise_workflow(option: Option<&str>, algorithm: &str) -> Result<()> {
     let private_key = directory.path().join("private.pem");
     let public_key = directory.path().join("public.pem");
     let bundle = directory.path().join("signature.json");
-
-    assert_success(
-        digestseal("keygen", option)
-            .arg("--private-key")
-            .arg(&private_key)
-            .arg("--public-key")
-            .arg(&public_key)
+    let image = registry.image(SOURCE);
+    generate_key(option, &private_key, &public_key)?;
+    assert_failure(
+        sign_command(option, &private_key, &bundle, &image)
+            .arg("--require-digest")
             .output()?,
+        "digest-pinned image reference",
     );
-    assert_success(
-        digestseal("sign", option)
-            .arg("--key")
-            .arg(&private_key)
-            .arg("--bundle")
-            .arg(&bundle)
-            .arg("--plain-http")
-            .arg(registry.image(SOURCE))
-            .output()?,
-    );
+    assert!(!bundle.exists());
+    assert_success(sign_command(option, &private_key, &bundle, &image).output()?);
     let signature = fs::read(&bundle)?;
     let envelope: Value = serde_json::from_slice(&signature)?;
     assert_eq!(envelope["payloadType"], PAYLOAD_TYPE);
@@ -69,15 +62,30 @@ fn exercise_workflow(option: Option<&str>, algorithm: &str) -> Result<()> {
     let (source_digest, source_attachment) = registry.attachment(SOURCE, &signature);
     fs::remove_file(private_key)?;
 
+    let writes = registry.state.lock().unwrap().write_requests;
+    let verify =
+        |target: &str| bundle_command("verify", option, &bundle, &public_key, target).output();
+    assert_success(verify(&registry.pinned_image(DESTINATION))?);
+    assert_failure(
+        verify(&registry.pinned_image(CHANGED))?,
+        "but the target resolves to",
+    );
+    assert_failure(
+        verify(&registry.image(DESTINATION))?,
+        "digest-pinned image reference",
+    );
+    assert_eq!(registry.state.lock().unwrap().write_requests, writes);
+
     let reuse = |repository| {
-        digestseal("reuse", option)
-            .arg("--bundle")
-            .arg(&bundle)
-            .arg("--public-key")
-            .arg(&public_key)
-            .arg("--plain-http")
-            .arg(registry.image(repository))
-            .output()
+        bundle_command(
+            "reuse",
+            option,
+            &bundle,
+            &public_key,
+            &registry.image(repository),
+        )
+        .arg("--native-referrers-only")
+        .output()
     };
 
     for _ in 0..2 {
@@ -90,15 +98,116 @@ fn exercise_workflow(option: Option<&str>, algorithm: &str) -> Result<()> {
     }
 
     let writes = registry.state.lock().unwrap().write_requests;
-    let output = reuse(CHANGED)?;
-    assert!(!output.status.success());
-    let diagnostic = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        diagnostic.contains("but the target resolves to"),
-        "{diagnostic}"
-    );
+    assert_failure(reuse(CHANGED)?, "but the target resolves to");
     assert_eq!(registry.state.lock().unwrap().write_requests, writes);
     Ok(())
+}
+
+#[test]
+fn referrers_fallback_merges_a_concurrent_update() -> Result<()> {
+    let registry = TestRegistry::start_with_referrers(false)?;
+    let directory = tempfile::tempdir()?;
+    let private = directory.path().join("private.pem");
+    let public = directory.path().join("public.pem");
+    let bundle = directory.path().join("signature.json");
+    let image = registry.pinned_image(SOURCE);
+    generate_key(None, &private, &public)?;
+
+    assert_failure(
+        sign_command(None, &private, &bundle, &image)
+            .args(["--require-digest", "--native-referrers-only"])
+            .output()?,
+        "required native OCI referrers API",
+    );
+    assert!(bundle.is_file());
+    assert_eq!(registry.state.lock().unwrap().write_requests, 0);
+
+    for _ in 0..2 {
+        assert_success(bundle_command("reuse", None, &bundle, &public, &image).output()?);
+    }
+    let (attachment, _) = registry.attachment(SOURCE, &fs::read(bundle)?);
+    let state = registry.state.lock().unwrap();
+    let repository = &state.repositories[SOURCE];
+    let raw = repository
+        .referrers_index
+        .as_ref()
+        .context("missing fallback index")?;
+    let index: Value = serde_json::from_slice(raw)?;
+    assert_eq!(index["annotations"]["example.fixture"], "preserved");
+    let entries = index["manifests"]
+        .as_array()
+        .context("missing fallback entries")?;
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["digest"], digest(b"another attachment"));
+    assert_eq!(entries[1]["digest"], attachment);
+    assert_eq!(repository.referrers_puts, 2);
+    Ok(())
+}
+
+#[test]
+fn sign_rejects_an_invalid_descriptor_before_creating_a_bundle() -> Result<()> {
+    let registry = TestRegistry::start()?;
+    let directory = tempfile::tempdir()?;
+    let private = directory.path().join("private.pem");
+    let public = directory.path().join("public.pem");
+    let bundle = directory.path().join("signature.json");
+    generate_key(None, &private, &public)?;
+    {
+        let mut state = registry.state.lock().unwrap();
+        let repository = state.repositories.get_mut(SOURCE).unwrap();
+        let mut manifest: Value = serde_json::from_slice(&repository.image)?;
+        manifest["config"]["size"] = json!(-1);
+        repository.image = serde_json::to_vec(&manifest)?;
+    }
+    assert_failure(
+        sign_command(None, &private, &bundle, &registry.pinned_image(SOURCE)).output()?,
+        "invalid image config descriptor",
+    );
+    assert!(!bundle.exists());
+    assert_eq!(registry.state.lock().unwrap().write_requests, 0);
+    Ok(())
+}
+
+fn generate_key(option: Option<&str>, private_key: &Path, public_key: &Path) -> Result<()> {
+    assert_success(
+        digestseal("keygen", option)
+            .arg("--private-key")
+            .arg(private_key)
+            .arg("--public-key")
+            .arg(public_key)
+            .output()?,
+    );
+    Ok(())
+}
+
+fn sign_command(option: Option<&str>, key: &Path, bundle: &Path, image: &str) -> Command {
+    let mut command = digestseal("sign", option);
+    command
+        .arg("--key")
+        .arg(key)
+        .arg("--bundle")
+        .arg(bundle)
+        .arg("--plain-http")
+        .arg(image);
+    command
+}
+
+fn bundle_command(
+    operation: &str,
+    option: Option<&str>,
+    bundle: &Path,
+    public_key: &Path,
+    image: &str,
+) -> Command {
+    let mut command = digestseal(operation, option);
+    command
+        .arg("--bundle")
+        .arg(bundle)
+        .arg("--public-key")
+        .arg(public_key)
+        .arg("--plain-http")
+        .arg(image);
+    command
 }
 
 fn digestseal(operation: &str, algorithm: Option<&str>) -> Command {
@@ -108,9 +217,13 @@ fn digestseal(operation: &str, algorithm: Option<&str>) -> Command {
         .env_remove("DIGESTSEAL_REGISTRY_USERNAME")
         .env_remove("DIGESTSEAL_REGISTRY_PASSWORD")
         .env_remove("DIGESTSEAL_REGISTRY_AUTH_HOST")
+        .env_remove("DIGESTSEAL_REGISTRY_HOST")
+        .env_remove("DIGESTSEAL_REGISTRY_STORAGE_HOST")
         .env_remove("MICROSIGN_REGISTRY_USERNAME")
         .env_remove("MICROSIGN_REGISTRY_PASSWORD")
         .env_remove("MICROSIGN_REGISTRY_AUTH_HOST")
+        .env_remove("MICROSIGN_REGISTRY_HOST")
+        .env_remove("MICROSIGN_REGISTRY_STORAGE_HOST")
         .env("NO_PROXY", "127.0.0.1")
         .env("no_proxy", "127.0.0.1");
     if let Some(algorithm) = algorithm {
@@ -129,6 +242,12 @@ fn assert_success(output: Output) {
     );
 }
 
+fn assert_failure(output: Output, expected: &str) {
+    assert!(!output.status.success());
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostic.contains(expected), "{diagnostic}");
+}
+
 struct TestRegistry {
     address: SocketAddr,
     state: Arc<Mutex<State>>,
@@ -138,16 +257,23 @@ struct TestRegistry {
 struct State {
     repositories: HashMap<&'static str, Repository>,
     write_requests: usize,
+    native_referrers: bool,
 }
 
 struct Repository {
     image: Vec<u8>,
     blobs: HashMap<String, Vec<u8>>,
     manifests: HashMap<String, Vec<u8>>,
+    referrers_index: Option<Vec<u8>>,
+    referrers_puts: usize,
 }
 
 impl TestRegistry {
     fn start() -> Result<Self> {
+        Self::start_with_referrers(true)
+    }
+
+    fn start_with_referrers(native_referrers: bool) -> Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .context("binding the test OCI registry to loopback")?;
         let address = listener.local_addr()?;
@@ -158,6 +284,7 @@ impl TestRegistry {
                 (CHANGED, Repository::new("changed")),
             ]),
             write_requests: 0,
+            native_referrers,
         }));
         let server_state = Arc::clone(&state);
         let server = thread::spawn(move || {
@@ -191,6 +318,12 @@ impl TestRegistry {
 
     fn image(&self, repository: &str) -> String {
         format!("{}/{repository}:latest", self.address)
+    }
+
+    fn pinned_image(&self, repository: &str) -> String {
+        let state = self.state.lock().unwrap();
+        let image_digest = digest(&state.repositories[repository].image);
+        format!("{}/{repository}@{image_digest}", self.address)
     }
 
     fn attachment(&self, repository: &str, signature: &[u8]) -> (String, Vec<u8>) {
@@ -240,6 +373,8 @@ impl Repository {
             image: serde_json::to_vec(&image).unwrap(),
             blobs: HashMap::new(),
             manifests: HashMap::new(),
+            referrers_index: None,
+            referrers_puts: 0,
         }
     }
 }
@@ -249,7 +384,7 @@ impl State {
         let mut parts = request_line.split_whitespace();
         let method = parts.next().context("missing method")?;
         let target = parts.next().context("missing target")?;
-        let mut length = 0;
+        let mut headers = HashMap::new();
         loop {
             let mut line = String::new();
             ensure!(
@@ -259,12 +394,15 @@ impl State {
             if line == "\r\n" {
                 break;
             }
-            if let Some((name, value)) = line.split_once(':')
-                && name.eq_ignore_ascii_case("content-length")
-            {
-                length = value.trim().parse()?;
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
             }
         }
+        let length = headers
+            .get("content-length")
+            .map(|length| length.parse())
+            .transpose()?
+            .unwrap_or(0);
         let mut body = vec![0; length];
         stream.read_exact(&mut body)?;
         let mut stream = stream.into_inner();
@@ -280,6 +418,7 @@ impl State {
         let (kind, reference) = path.split_once('/').context("missing registry reference")?;
         let state = self.repositories.get_mut(repository).unwrap();
         let subject = digest(&state.image);
+        let referrers_tag = subject.replace(':', "-");
         if matches!(method, "POST" | "PUT") {
             self.write_requests += 1;
         }
@@ -294,6 +433,26 @@ impl State {
                     ],
                     &state.image,
                 )?;
+            }
+            ("GET", "referrers", reference) if self.native_referrers && reference == subject => {
+                let index = json!({"schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": []});
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    &[("Content-Type", OCI_INDEX)],
+                    &serde_json::to_vec(&index)?,
+                )?;
+            }
+            ("GET", "manifests", reference) if reference == referrers_tag => {
+                match &state.referrers_index {
+                    Some(raw) => respond(
+                        &mut stream,
+                        "200 OK",
+                        &[("Content-Type", OCI_INDEX), ("ETag", "\"referrers-index\"")],
+                        raw,
+                    )?,
+                    None => respond(&mut stream, "404 Not Found", &[], &[])?,
+                }
             }
             ("HEAD", "blobs", digest) if state.blobs.contains_key(digest) => {
                 respond(
@@ -323,6 +482,35 @@ impl State {
                     &[],
                 )?;
             }
+            ("PUT", "manifests", reference) if reference == referrers_tag => {
+                state.referrers_puts += 1;
+                if state.referrers_index.is_none() {
+                    ensure!(
+                        headers.get("if-none-match").map(String::as_str) == Some("*"),
+                        "fallback creation must be conditional"
+                    );
+                    let competing_index = json!({
+                        "schemaVersion": 2,
+                        "mediaType": OCI_INDEX,
+                        "manifests": [{
+                            "mediaType": OCI_MANIFEST,
+                            "artifactType": SIGNATURE,
+                            "size": 18,
+                            "digest": digest(b"another attachment"),
+                        }],
+                        "annotations": { "example.fixture": "preserved" },
+                    });
+                    state.referrers_index = Some(serde_json::to_vec(&competing_index)?);
+                    respond(&mut stream, "412 Precondition Failed", &[], &[])?;
+                } else {
+                    ensure!(
+                        headers.get("if-match").map(String::as_str) == Some("\"referrers-index\""),
+                        "fallback update must use the fetched ETag"
+                    );
+                    state.referrers_index = Some(body);
+                    respond(&mut stream, "201 Created", &[], &[])?;
+                }
+            }
             ("PUT", "manifests", address) => {
                 ensure!(address == digest(&body), "incorrect artifact digest");
                 let manifest: Value = serde_json::from_slice(&body)?;
@@ -340,15 +528,11 @@ impl State {
                     );
                 }
                 state.manifests.insert(address.to_owned(), body);
-                respond(
-                    &mut stream,
-                    "201 Created",
-                    &[
-                        ("Docker-Content-Digest", address),
-                        ("OCI-Subject", &subject),
-                    ],
-                    &[],
-                )?;
+                let mut headers = vec![("Docker-Content-Digest", address)];
+                if self.native_referrers {
+                    headers.push(("OCI-Subject", &subject));
+                }
+                respond(&mut stream, "201 Created", &headers, &[])?;
             }
             _ => respond(&mut stream, "404 Not Found", &[], &[])?,
         }

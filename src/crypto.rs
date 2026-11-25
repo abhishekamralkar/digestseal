@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
+#[cfg(windows)]
+mod windows;
+
 const MAX_KEY_FILE_SIZE: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
@@ -161,9 +164,10 @@ pub fn generate_keypair(
 
     let (private_pem, public_pem) = SigningKey::generate(algorithm)?.to_pem()?;
 
-    // Stage both files before publishing either. Named temporary files use mode 0600 on Unix.
-    let private_file = stage_key_file(&private_key_path, private_pem.as_bytes())?;
-    let public_file = stage_key_file(&public_key_path, public_pem.as_bytes())?;
+    let private_file = stage_key_file(&private_key_path, private_pem.as_bytes(), private_tempfile)?;
+    let public_file = stage_key_file(&public_key_path, public_pem.as_bytes(), |parent| {
+        NamedTempFile::new_in(parent)
+    })?;
     let public_file = public_file
         .persist_noclobber(&public_key_path)
         .map_err(|error| error.error)
@@ -296,16 +300,29 @@ fn new_file_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn stage_key_file(path: &Path, bytes: &[u8]) -> Result<NamedTempFile> {
+fn stage_key_file(
+    path: &Path,
+    bytes: &[u8],
+    create: impl FnOnce(&Path) -> io::Result<NamedTempFile>,
+) -> Result<NamedTempFile> {
     let parent = path
         .parent()
         .context("key output has no parent directory")?;
-    let mut file = NamedTempFile::new_in(parent)
-        .with_context(|| format!("staging key file {}", path.display()))?;
+    let mut file =
+        create(parent).with_context(|| format!("staging key file {}", path.display()))?;
     file.write_all(bytes)
         .and_then(|()| file.as_file().sync_all())
         .with_context(|| format!("writing key file {}", path.display()))?;
     Ok(file)
+}
+
+#[cfg(windows)]
+use windows::private_tempfile;
+
+#[cfg(not(windows))]
+fn private_tempfile(parent: &Path) -> io::Result<NamedTempFile> {
+    // Named temporary files use mode 0600 on Unix.
+    NamedTempFile::new_in(parent)
 }
 
 #[cfg(unix)]
@@ -339,6 +356,25 @@ mod tests {
 
     const ALGORITHMS: [Algorithm; 3] =
         [Algorithm::MlDsa65, Algorithm::Ed25519, Algorithm::EcdsaP256];
+
+    #[test]
+    fn imports_the_rfc_9881_ml_dsa_65_seed_key() -> Result<()> {
+        // RFC 9881 C.1.2.1, with the SPKI fingerprint independently derived by OpenSSL.
+        let pem = concat!(
+            "-----BEGIN PRIVATE KEY-----\n",
+            "MDQCAQAwCwYJYIZIAWUDBAMSBCKAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZ\n",
+            "GhscHR4f\n",
+            "-----END PRIVATE KEY-----\n",
+        );
+        let key = SigningKey::MlDsa65(load_ml_dsa_private_key(pem)?);
+        assert_eq!(
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                key.public_key_der()?
+            )),
+            "b8b62131bfbe84433efb2273d7f5b87f7a22854a2cfd366fc2aead86d837c52d",
+        );
+        Ok(())
+    }
 
     #[test]
     fn generated_pem_round_trips_with_the_matching_key_and_algorithm() -> Result<()> {

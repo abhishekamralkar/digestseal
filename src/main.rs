@@ -6,12 +6,12 @@ mod registry;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
 
 use crate::crypto::Algorithm;
-use crate::reference::ImageReference;
-use crate::registry::Registry;
+use crate::reference::{ImageReference, Selector};
+use crate::registry::{Registry, ResolvedImage};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -42,21 +42,48 @@ enum Command {
         /// Save the bundle without attaching it to the registry image.
         #[arg(long)]
         bundle_only: bool,
+        /// Require an image reference pinned to a digest.
+        #[arg(long)]
+        require_digest: bool,
+        /// Require the native OCI referrers API for publication.
+        #[arg(long, conflicts_with = "bundle_only")]
+        native_referrers_only: bool,
         #[command(flatten)]
         target: ImageTarget,
     },
     /// Attach an existing bundle to an image with the same digest.
     Reuse {
-        #[arg(long, value_enum, default_value = "ml-dsa-65")]
-        algorithm: Algorithm,
-        #[arg(long, value_name = "FILE")]
-        bundle: PathBuf,
-        /// Trusted public key used to authenticate the bundle.
-        #[arg(long, value_name = "FILE")]
-        public_key: PathBuf,
+        /// Require the native OCI referrers API for publication.
+        #[arg(long)]
+        native_referrers_only: bool,
         #[command(flatten)]
-        target: ImageTarget,
+        input: BundleTarget,
     },
+    /// Verify a detached bundle against a digest-pinned image with pull access.
+    Verify(BundleTarget),
+}
+
+#[derive(Args)]
+struct BundleTarget {
+    #[arg(long, value_enum, default_value = "ml-dsa-65")]
+    algorithm: Algorithm,
+    #[arg(long, value_name = "FILE")]
+    bundle: PathBuf,
+    /// Trusted public key used to authenticate the bundle.
+    #[arg(long, value_name = "FILE")]
+    public_key: PathBuf,
+    #[command(flatten)]
+    target: ImageTarget,
+}
+
+impl BundleTarget {
+    fn authenticate(&self) -> Result<(Vec<u8>, bundle::ImagePayload)> {
+        let bytes = bundle::load(&self.bundle)?;
+        let key = crypto::PublicKey::load(&self.public_key, self.algorithm)?;
+        let payload = bundle::authenticate(&bytes, &key)
+            .with_context(|| format!("Authenticating bundle {}", self.bundle.display()))?;
+        Ok((bytes, payload))
+    }
 }
 
 #[derive(Args)]
@@ -64,9 +91,19 @@ struct ImageTarget {
     /// OCI image reference, with a tag or a digest.
     #[arg(value_name = "IMAGE")]
     image: ImageReference,
-    /// Connect to the registry over plain HTTP (for local testing).
+    /// Use unauthenticated HTTP for a loopback test registry.
     #[arg(long)]
     plain_http: bool,
+}
+
+impl ImageTarget {
+    fn require_digest(&self) -> Result<()> {
+        ensure!(
+            matches!(self.image.selector, Selector::Digest(_)),
+            "use a digest-pinned image reference (IMAGE@DIGEST)"
+        );
+        Ok(())
+    }
 }
 
 fn main() -> ExitCode {
@@ -94,13 +131,20 @@ fn run(command: Command) -> Result<()> {
             key,
             bundle: path,
             bundle_only,
+            require_digest,
+            native_referrers_only,
             target,
         } => {
+            if require_digest {
+                target.require_digest()?;
+            }
             bundle::ensure_new(&path)?;
-            let key = crypto::SigningKey::load(&key, algorithm)?;
             let registry = Registry::new(&target.image, target.plain_http)?;
             let image = registry.resolve()?;
-            let bundle = bundle::sign(&key, &image)?;
+            let bundle = {
+                let key = crypto::SigningKey::load(&key, algorithm)?;
+                bundle::sign(&key, &image)?
+            };
             bundle::save(&path, &bundle)?;
             println!("Saved signature bundle to {}", path.display());
             println!(
@@ -108,28 +152,45 @@ fn run(command: Command) -> Result<()> {
                 target.image.registry, target.image.repository, image.descriptor.digest
             );
             if !bundle_only {
-                publish(&registry, &target.image, &image, &bundle).with_context(|| {
+                publish(
+                    &registry,
+                    &target.image,
+                    &image,
+                    &bundle,
+                    native_referrers_only,
+                )
+                .with_context(|| {
                     format!(
-                        "Bundle saved at {}. Run reuse to retry publication with the same signature",
+                        "Bundle saved at {}. Run reuse with the same publication options to retry",
                         path.display()
                     )
                 })?;
             }
         }
         Command::Reuse {
-            algorithm,
-            bundle: path,
-            public_key,
-            target,
+            native_referrers_only,
+            input,
         } => {
-            let bytes = bundle::load(&path)?;
-            let public_key = crypto::PublicKey::load(&public_key, algorithm)?;
-            let signed_image = bundle::authenticate(&bytes, &public_key)
-                .with_context(|| format!("Authenticating bundle {}", path.display()))?;
+            let (bytes, signed_image) = input.authenticate()?;
+            let target = &input.target;
             let registry = Registry::new(&target.image, target.plain_http)?;
             let image = registry.resolve()?;
             signed_image.matches(&image)?;
-            publish(&registry, &target.image, &image, &bytes)?;
+            publish(
+                &registry,
+                &target.image,
+                &image,
+                &bytes,
+                native_referrers_only,
+            )?;
+        }
+        Command::Verify(input) => {
+            let target = &input.target;
+            target.require_digest()?;
+            let (_, signed_image) = input.authenticate()?;
+            let registry = Registry::new(&target.image, target.plain_http)?;
+            signed_image.matches(&registry.resolve()?)?;
+            println!("Verified {}", target.image);
         }
     }
     Ok(())
@@ -138,10 +199,16 @@ fn run(command: Command) -> Result<()> {
 fn publish(
     registry: &Registry,
     reference: &ImageReference,
-    image: &registry::ResolvedImage,
+    image: &ResolvedImage,
     bundle: &[u8],
+    native_referrers_only: bool,
 ) -> Result<()> {
-    let signature = registry.publish(&image.descriptor, bundle::ARTIFACT_TYPE, bundle)?;
+    let signature = registry.publish(
+        &image.descriptor,
+        bundle::ARTIFACT_TYPE,
+        bundle,
+        native_referrers_only,
+    )?;
     println!(
         "Published signature {}/{}@{}",
         reference.registry, reference.repository, signature.digest

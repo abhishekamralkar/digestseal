@@ -6,9 +6,20 @@ DigestSeal is a Rust CLI for signing OCI images. It defaults to NIST ML-DSA-65 a
 
 ## Install
 
-Download the archive for your platform and verify it against the release's `SHA256SUMS` file. Extract `digestseal` (or `digestseal.exe` on Windows) and put it on your `PATH`. Releases include Linux and macOS binaries for x86-64 and ARM64, plus a Windows x86-64 binary. The Linux binaries are built against glibc on Ubuntu 24.04. [GitHub Releases](https://github.com/abhishekamralkar/digestseal/releases)
+Download the archive for your platform and verify it against the release's `SHA256SUMS` file. To verify build provenance for an attested release, replace `ARCHIVE` with the downloaded filename and `VERSION` with its release tag. [GitHub Releases](https://github.com/abhishekamralkar/digestseal/releases)
+
+```sh
+gh attestation verify ARCHIVE \
+  --repo abhishekamralkar/digestseal \
+  --signer-workflow abhishekamralkar/digestseal/.github/workflows/release.yml \
+  --source-ref refs/tags/VERSION
+```
+
+Extract `digestseal` (or `digestseal.exe` on Windows) and put it on your `PATH`. Releases include Linux and macOS binaries for x86-64 and ARM64, plus a Windows x86-64 binary. The Linux binaries are built against glibc on Ubuntu 24.04.
 
 ## Build
+
+Building from source requires Rust 1.88 or later.
 
 ```sh
 cargo build --release --locked
@@ -33,17 +44,28 @@ digestseal reuse --bundle app.sig.json --public-key signing.pub.pem \
 
 `sign` resolves the tag once, signs the manifest or multi-platform index it points to, and saves the bundle before uploading it. It prints the digest-pinned image reference. Use that reference when copying or deploying an image so a moving tag cannot select a different build. Use `--bundle-only` with pull access to defer publication. If publication fails after saving the bundle, run `reuse` with the saved bundle and the original digest-pinned reference to retry.
 
+In CI, pass the digest emitted by the build as `IMAGE@DIGEST` and use `sign --require-digest` to reject tags. DigestSeal checks the top-level manifest or index and the syntax of its descriptors. A runtime pulling the image should verify the referenced blobs against those descriptors.
+
 `reuse` authenticates the bundle with the supplied trusted public key and compares the destination manifest with the signed manifest. If they match, it publishes the original bundle bytes, so promotion jobs need only the public key and destination registry access. The same bundle and subject produce the same referrer digest on retries. If the destination uses a different digest algorithm for tags, address it by the original signed digest. Image conversions that rewrite the manifest produce a new digest and require a new signature.
+
+## Verify before deployment
+
+```sh
+digestseal verify --bundle app.sig.json --public-key signing.pub.pem \
+  "registry.example.com/prod/app@${DIGEST}"
+```
+
+`verify` uses pull access and requires a digest-pinned reference. It authenticates the detached bundle using the trusted public key and checks the resolved manifest's digest, media type, size, and SHA-512 hash.
 
 ## Signing algorithms
 
-`keygen`, `sign`, and `reuse` default to `ml-dsa-65`, including when reusing an existing ML-DSA-65 bundle. For a classical key and bundle, pass the same `--algorithm` value to all three commands.
+`keygen`, `sign`, `reuse`, and `verify` default to `ml-dsa-65`. For a classical key and bundle, pass the matching `--algorithm` value to each command.
 
 ```sh
 digestseal keygen --algorithm ed25519 --private-key signing.key.pem --public-key signing.pub.pem
 ```
 
-An existing Ed25519 or P-256 key pair in the PEM formats below can be used directly with `sign` and `reuse`.
+An existing Ed25519 or P-256 key pair in the PEM formats below can be used directly with `sign`, `reuse`, and `verify`.
 
 | `--algorithm` | Signed `algorithm` value | Signature |
 | --- | --- | --- |
@@ -53,15 +75,17 @@ An existing Ed25519 or P-256 key pair in the PEM formats below can be used direc
 
 ## Registry access
 
-Registry requests use HTTPS and can start anonymously. For private registries, set `DIGESTSEAL_REGISTRY_USERNAME` and `DIGESTSEAL_REGISTRY_PASSWORD` in the command's environment. Use a registry token as the password where supported. Grant pull access to resolve the image and push access to publish its referrer. For a registry with a separate trusted HTTPS token service, set `DIGESTSEAL_REGISTRY_AUTH_HOST` to that service's hostname and optional port. Docker Hub's token host is recognized automatically. `--plain-http` enables HTTP for a local test registry.
+Registry requests use HTTPS and can start anonymously. For private registries, set `DIGESTSEAL_REGISTRY_HOST` to the registry hostname and optional port, and set `DIGESTSEAL_REGISTRY_USERNAME` and `DIGESTSEAL_REGISTRY_PASSWORD`. Use a registry token as the password where supported. Grant pull access to resolve or verify an image and push access to publish its referrer.
 
-DigestSeal reads the corresponding legacy `MICROSIGN_REGISTRY_*` variables when all three `DIGESTSEAL_REGISTRY_*` settings are unset.
+Set `DIGESTSEAL_REGISTRY_AUTH_HOST` to the hostname and optional port of a separate trusted HTTPS token service. Docker Hub's token host is recognized automatically. If the registry delegates blob uploads to an HTTPS storage origin, allow that origin with `DIGESTSEAL_REGISTRY_STORAGE_HOST`. Blob requests to that origin are credential-free. `--plain-http` is for unauthenticated test registries on localhost or a loopback IP.
 
-For registries that use referrers tags and ignore conditional updates, serialize publication of different signatures for the same repository and subject digest to protect the shared index.
+DigestSeal reads the corresponding legacy `MICROSIGN_REGISTRY_*` variables when all `DIGESTSEAL_REGISTRY_*` settings are unset. Legacy credentials also require `MICROSIGN_REGISTRY_HOST`.
+
+Pass `--native-referrers-only` to `sign` or `reuse` to require the native OCI referrers API before upload. If using a registry whose fallback tags ignore conditional updates, serialize publication of different signatures for the same repository and subject digest to protect the shared index.
 
 ## Signature format and compliance
 
-- Private keys use unencrypted PKCS#8 PEM and are created with `0600` permissions on Unix. Public keys use SubjectPublicKeyInfo (SPKI) PEM. ML-DSA-65 private keys use the RFC 9881 seed form. Distribute the public key through a trusted channel. [RFC 9881](https://www.rfc-editor.org/rfc/rfc9881.html)
+- Private keys use unencrypted PKCS#8 PEM. `keygen` creates them with `0600` permissions on Unix and an owner-only access list on Windows. Public keys use SubjectPublicKeyInfo (SPKI) PEM. ML-DSA-65 private keys use the RFC 9881 seed form. Distribute the public key through a trusted channel. [RFC 9881](https://www.rfc-editor.org/rfc/rfc9881.html)
 - The bundle is a single-signature DSSE JSON envelope with payload type `application/vnd.microsign.image-signature.payload.v1+json`. The signed JSON includes `algorithm`, `subject` (the OCI descriptor with `mediaType`, `digest`, and `size`), and `manifestSha512` (the `sha512:` digest of the raw manifest bytes). The optional DSSE `keyid` gives the SHA-256 fingerprint of the public SPKI DER. Consumers can verify the DSSE message using the matching signature algorithm and a trusted public key. [DSSE protocol](https://github.com/dsse-lf/dsse/blob/master/protocol.md)
 - The OCI artifact type and bundle layer media type are both `application/vnd.microsign.signature.v1+json`. To find it, run `oras discover --artifact-type application/vnd.microsign.signature.v1+json IMAGE`. DigestSeal retains the original media types so existing bundles remain discoverable and reusable. [OCI image manifest specification](https://github.com/opencontainers/image-spec/blob/v1.1.1/manifest.md) · [OCI distribution specification](https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md)
 

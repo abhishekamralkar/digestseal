@@ -135,12 +135,24 @@ pub fn save(path: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    #[cfg(unix)]
+    let parent = File::open(directory)
+        .with_context(|| format!("Opening bundle directory {}", directory.display()))?;
     let mut file = tempfile::NamedTempFile::new_in(directory)
         .with_context(|| format!("Creating temporary bundle in {}", directory.display()))?;
-    file.write_all(bytes)?;
-    file.as_file().sync_all()?;
+    file.write_all(bytes)
+        .and_then(|()| file.as_file().sync_all())
+        .with_context(|| format!("Writing bundle {}", path.display()))?;
     file.persist_noclobber(path)
         .with_context(|| format!("Saving bundle {}", path.display()))?;
+    // The file sync does not make the new directory entry durable.
+    #[cfg(unix)]
+    parent.sync_all().with_context(|| {
+        format!(
+            "Bundle {} was saved but its directory could not be synchronized",
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -162,6 +174,46 @@ pub fn load(path: &Path) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::crypto;
+
+    #[test]
+    fn verifies_bundle_signed_by_openssl() -> Result<()> {
+        // OpenSSL signed this exact payload using independently assembled DSSE PAE.
+        let payload = concat!(
+            r#"{"algorithm":"Ed25519","subject":{"mediaType":"application/vnd.oci.image.manifest.v1+json","#,
+            r#""digest":"sha256:6ae2621842b9924bc60f532c86de098318bad18bef01c826eee55433c8b12955","size":20},"#,
+            r#""manifestSha512":"sha512:bc01447a9f9ee5397ce4cfcdb1f92e2300b8e7ceb8d7f8b79ff7a8d72dd3731fa2"#,
+            r#"ab24e600e590f42a1100fed7b6f563c860e7b8f5b7d9b2193b5ac6e2b5f94e"}"#,
+        );
+        let envelope = serde_json::json!({
+            "payloadType": "application/vnd.microsign.image-signature.payload.v1+json",
+            "payload": STANDARD.encode(payload),
+            "signatures": [{
+                "sig": "t1N96ExukAR3yHt9Hbeco4+C+gQ0rDTqjOe5YBoIXQZBkVls61O4FbjBgc8jPaRHtW2U3h4oTfgzPRyDt0MRDg==",
+            }],
+        });
+        let dir = tempfile::tempdir()?;
+        let public_path = dir.path().join("pub.pem");
+        fs::write(
+            &public_path,
+            concat!(
+                "-----BEGIN PUBLIC KEY-----\n",
+                "MCowBQYDK2VwAyEAFR7xRHFi3/ExuE/eC/4OQL6jQ4PXYQTxVvgotRqO+Mo=\n",
+                "-----END PUBLIC KEY-----\n",
+            ),
+        )?;
+        let key = PublicKey::load(&public_path, Algorithm::Ed25519)?;
+        let metadata = authenticate(&serde_json::to_vec(&envelope)?, &key)?;
+        assert_eq!(metadata.algorithm, Algorithm::Ed25519);
+        assert_eq!(
+            metadata.subject.digest,
+            Digest::sha256(b"example OCI manifest")
+        );
+        assert_eq!(
+            metadata.manifest_sha512,
+            Digest::sha512(b"example OCI manifest")
+        );
+        Ok(())
+    }
 
     #[test]
     fn reuse_checks_the_signed_manifest_and_algorithm() -> Result<()> {
